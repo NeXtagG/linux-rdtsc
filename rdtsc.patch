@@ -1,0 +1,135 @@
+KVM/VMX: force RDTSC exiting and return a TSC with the VM-exit cost shaved off
+
+Every guest RDTSC/RDTSCP exits to KVM. handle_rdtsc() returns a TSC that
+advances 1:1 with the host but has VMEXIT_COST cycles subtracted from each
+delta, so the cpuid-bracketed rdtsc spike (pafish rdtsc_diff_vmexit,
+al-khaser) disappears while the guest still calibrates the real frequency.
+Intel VMX only.
+
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -522,7 +522,8 @@
+ 	 CPU_BASED_MONITOR_EXITING |					\
+ 	 CPU_BASED_INVLPG_EXITING |					\
+ 	 CPU_BASED_RDPMC_EXITING |					\
+-	 CPU_BASED_INTR_WINDOW_EXITING)
++	 	 CPU_BASED_RDTSC_EXITING |					\
++		  CPU_BASED_INTR_WINDOW_EXITING)
+ 
+ #ifdef CONFIG_X86_64
+ 	#define KVM_REQUIRED_VMX_CPU_BASED_VM_EXEC_CONTROL		\
+@@ -535,8 +536,7 @@
+ #endif
+ 
+ #define KVM_OPTIONAL_VMX_CPU_BASED_VM_EXEC_CONTROL			\
+-	(CPU_BASED_RDTSC_EXITING |					\
+-	 CPU_BASED_TPR_SHADOW |						\
++	(CPU_BASED_TPR_SHADOW |						\
+ 	 CPU_BASED_USE_IO_BITMAPS |					\
+ 	 CPU_BASED_MONITOR_TRAP_FLAG |					\
+ 	 CPU_BASED_USE_MSR_BITMAPS |					\
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -4627,11 +4627,12 @@
+ 	 * Not used by KVM, but fully supported for nesting, i.e. are allowed in
+ 	 * vmcs12 and propagated to vmcs02 when set in vmcs12.
+ 	 */
+-	exec_control &= ~(CPU_BASED_RDTSC_EXITING |
+-			  CPU_BASED_USE_IO_BITMAPS |
++	exec_control &= ~(CPU_BASED_USE_IO_BITMAPS |
+ 			  CPU_BASED_MONITOR_TRAP_FLAG |
+ 			  CPU_BASED_PAUSE_EXITING);
+ 
++	/* Force RDTSC exiting for handle_rdtsc() */
++	exec_control |= CPU_BASED_RDTSC_EXITING;
+ 	/* INTR_WINDOW_EXITING and NMI_WINDOW_EXITING are toggled dynamically */
+ 	exec_control &= ~(CPU_BASED_INTR_WINDOW_EXITING |
+ 			  CPU_BASED_NMI_WINDOW_EXITING);
+@@ -6309,6 +6310,78 @@
+ 				     vmx_get_msr_imm_reg(vcpu));
+ }
+ 
++static u32 print_once = 1;
++
++/*
++ * Cycles to shave off each rdtsc delta: roughly the cost of one VM-exit.
++ * Subtracting (not dividing) hides the cpuid-bracketed rdtsc spike that
++ * pafish's rdtsc_diff_vmexit looks for, while leaving the TSC rate at 1:1
++ * so the guest still calibrates the real host frequency.
++ * Tune 1500-4000: higher hides better but lowers apparent freq under
++ * tight rdtsc-polling calibration.
++ */
++#ifndef VMEXIT_COST
++#define VMEXIT_COST 2500ULL
++#endif
++
++static u64 fake_rdtsc(void)
++{
++	static u64 rdtsc_fake = 0;
++	static u64 rdtsc_prev = 0;
++	u64 rdtsc_real = rdtsc();
++
++	if (print_once) {
++		pr_info("[handle_rdtsc] fake rdtsc vmx function is working\n");
++		print_once = 0;
++		rdtsc_fake = rdtsc_real;
++	}
++
++	if (rdtsc_prev != 0) {
++		if (rdtsc_real > rdtsc_prev) {
++			u64 diff = rdtsc_real - rdtsc_prev;
++			/* srezaem tolko gorb ot VM-exit, temp TSC ne trogaem */
++			if (diff > VMEXIT_COST)
++				diff -= VMEXIT_COST;
++			else
++				diff = 1; /* monotonnost */
++			rdtsc_fake += diff;
++		}
++	}
++	if (rdtsc_fake > rdtsc_real)
++		rdtsc_fake = rdtsc_real;
++
++	rdtsc_prev = rdtsc_real;
++	return rdtsc_fake;
++}
++
++static int handle_rdtsc(struct kvm_vcpu *vcpu)
++{
++	u64 tsc = fake_rdtsc();
++
++	vcpu->arch.regs[VCPU_REGS_RAX] = tsc & 0xffffffffu;
++	vcpu->arch.regs[VCPU_REGS_RDX] = (tsc >> 32) & 0xffffffffu;
++
++	return skip_emulated_instruction(vcpu);
++}
++
++/*
++ * With RDTSC exiting forced on, RDTSCP exits too (exit reason 51).  Without a
++ * handler KVM reports "unexpected exit reason 0x33" and the guest hangs.
++ */
++static int handle_rdtscp(struct kvm_vcpu *vcpu)
++{
++	u64 tsc = fake_rdtsc();
++	u64 aux = 0;
++
++	__kvm_emulate_msr_read(vcpu, MSR_TSC_AUX, &aux);
++
++	vcpu->arch.regs[VCPU_REGS_RAX] = tsc & 0xffffffffu;
++	vcpu->arch.regs[VCPU_REGS_RDX] = (tsc >> 32) & 0xffffffffu;
++	vcpu->arch.regs[VCPU_REGS_RCX] = aux & 0xffffffffu;
++
++	return skip_emulated_instruction(vcpu);
++}
++
+ /*
+  * The exit handlers return 1 if the exit was handled fully and guest execution
+  * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
+@@ -6367,6 +6440,8 @@
+ 	[EXIT_REASON_ENCLS]		      = handle_encls,
+ 	[EXIT_REASON_BUS_LOCK]                = handle_bus_lock_vmexit,
+ 	[EXIT_REASON_NOTIFY]		      = handle_notify,
++	[EXIT_REASON_RDTSC]		      = handle_rdtsc,
++	[EXIT_REASON_RDTSCP]		      = handle_rdtscp,
+ 	[EXIT_REASON_SEAMCALL]		      = handle_tdx_instruction,
+ 	[EXIT_REASON_TDCALL]		      = handle_tdx_instruction,
+ 	[EXIT_REASON_MSR_READ_IMM]            = handle_rdmsr_imm,
