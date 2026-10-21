@@ -3,7 +3,7 @@
 Ядро Linux 7.2.5 с патчем KVM, который прячет от Windows-гостя главный
 «временной» признак виртуалки: скачок RDTSC при VM-exit.
 
-Для intel на Amd проверок не было
+Для intel, на Amd проверок не было
 
 Пара к [qemu-stealth](https://github.com/NeXtagG/qemu-stealth): QEMU
 закрывает строки, SMBIOS и ACPI, а этот признак живёт в KVM, то есть в ядре.
